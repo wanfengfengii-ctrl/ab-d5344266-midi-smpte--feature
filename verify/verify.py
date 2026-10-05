@@ -3,8 +3,10 @@
 Runs, in order:
   1. code tests   -- the unit-test suite (stdlib unittest)
   2. build check  -- byte-compile every source tree and import the modules
-  3. API smoke    -- POST a multi-track, tempo-changing format-1 file plus
-                     structural-error cases to a healthy app container
+  3. API smoke    -- POST a multi-track, tempo-changing format-1 PPQN file,
+                     a multi-track SMPTE -29 file whose tempo events must be
+                     inert, plus structural/division-error cases, all to a
+                     healthy app container
 
 Every step is reported on stdout; the process exit code is 0 only when all
 steps pass, so `docker compose up --exit-code-from verify verify` surfaces
@@ -89,6 +91,32 @@ def build_smoke_file():
         + EOT
     )
     return header(1, 3, 480) + track(conductor) + track(piano) + track(strings)
+
+
+def smpte_division(fps_code, ticks_per_frame):
+    return ((fps_code & 0xFF) << 8) | ticks_per_frame
+
+
+def build_smpte_smoke_file():
+    """Format 1, SMPTE -29 (30000/1001 fps), 100 ticks/frame, two tracks.
+
+    Track 0 carries two legal tempo events that must not move anything;
+    events on track 1 interleave in tick order across tracks.
+    """
+    conductor = tempo(0, 1) + tempo(50, 7) + EOT
+    piano = (
+        ev(0, 0x90, 60, 100)        # tick 0
+        + ev(100, 0x80, 60, 0)      # tick 100 (one frame)
+        + ev(100, 0x90, 62, 100)    # tick 200 (two frames)
+        + EOT
+    )
+    strings = ev(50, 0x91, 65, 100) + EOT  # tick 50 (half a frame)
+    return (
+        header(1, 3, smpte_division(-29, 100))
+        + track(conductor)
+        + track(piano)
+        + track(strings)
+    )
 
 
 # Expected timeline for build_smoke_file(): (tick, track, order, type,
@@ -193,8 +221,7 @@ def step_wait_for_app():
 
 
 def step_api_smoke():
-    print("[4/4] API smoke: multi-track tempo-changing file + error cases",
-          flush=True)
+    print("[4/4] API smoke: PPQN + SMPTE files and error cases", flush=True)
     suite = Suite()
 
     # -- happy path: format 1, three tracks, tempo changes ----------------
@@ -235,6 +262,77 @@ def step_api_smoke():
         )
     keys = [(e["tick"], e["track"], e["order"]) for e in events]
     suite.check("events sorted by (tick, track, order)", keys == sorted(keys))
+
+    # -- happy path: SMPTE -29 df, tempo events must be inert -------------
+    status, body = post(build_smpte_smoke_file())
+    suite.check("SMPTE: status 200", status == 200, f"got {status}: {body}")
+    if status != 200:
+        return False
+    suite.check("SMPTE: no ppqn field", "ppqn" not in body)
+    td = body.get("time_division", {})
+    suite.check("SMPTE: type", td.get("type") == "smpte", f"got {td}")
+    suite.check("SMPTE: fps_code -29", td.get("fps_code") == -29)
+    suite.check(
+        "SMPTE: frame_rate 30000/1001",
+        td.get("frame_rate", {}).get("fraction") == "30000/1001",
+        f"got {td.get('frame_rate')}",
+    )
+    suite.check("SMPTE: ticks_per_frame 100", td.get("ticks_per_frame") == 100)
+    smpte_events = body.get("events", [])
+    suite.check(
+        "SMPTE: 4 events", len(smpte_events) == 4, f"got {len(smpte_events)}"
+    )
+    # 1 tick = 1_000_000*1001/(30000*100) = 1001/3 us; tempo meta ignored.
+    smpte_expected = [
+        (0, 1, 0, "0/1"),
+        (50, 2, 0, "50050/3"),
+        (100, 1, 1, "100100/3"),
+        (200, 1, 2, "200200/3"),
+    ]
+    for i, (tick, trk, order, fraction) in enumerate(smpte_expected):
+        if i >= len(smpte_events):
+            break
+        got = smpte_events[i]
+        suite.check(
+            f"SMPTE event {i} position",
+            (got.get("tick"), got.get("track"), got.get("order"))
+            == (tick, trk, order),
+            f"got {(got.get('tick'), got.get('track'), got.get('order'))}",
+        )
+        suite.check(
+            f"SMPTE event {i} time {fraction}",
+            got.get("time_us", {}).get("fraction") == fraction,
+            f"got {got.get('time_us')}",
+        )
+    smpte_keys = [
+        (e["tick"], e["track"], e["order"]) for e in smpte_events
+    ]
+    suite.check(
+        "SMPTE: events sorted by (tick, track, order)",
+        smpte_keys == sorted(smpte_keys),
+    )
+
+    # -- SMPTE division errors: offsets reported, never a partial timeline -
+    smpte_error_cases = [
+        ("SMPTE illegal fps code", header(1, 1, 0xE628), "invalid_smpte_fps", 12),
+        ("SMPTE zero ticks/frame", header(1, 1, 0xE800),
+         "invalid_smpte_resolution", 13),
+        (
+            "SMPTE damaged track body",
+            header(0, 1, 0xE728) + track(ev(0, 0xF8)),
+            "illegal_status",
+            23,
+        ),
+    ]
+    for label, payload, code, offset in smpte_error_cases:
+        status, body = post(payload)
+        err = body.get("error", {})
+        suite.check(f"{label}: HTTP 400", status == 400, f"got {status}")
+        suite.check(f"{label}: code {code}", err.get("code") == code,
+                    f"got {err.get('code')}")
+        suite.check(f"{label}: offset {offset}", err.get("offset") == offset,
+                    f"got {err.get('offset')}")
+        suite.check(f"{label}: no partial timeline", "events" not in body)
 
     # -- structural errors: offset reported, no partial timeline ----------
     valid = build_smoke_file()

@@ -85,11 +85,31 @@ class HeaderTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "unsupported_format")
         self.assertEqual(ctx.exception.offset, 8)
 
-    def test_smpte_division_rejected(self):
+    def test_smpte_illegal_fps_code_rejected(self):
+        # Signed codes -26, -23, -31 are not among -24/-25/-29/-30.
+        for code in (0xE6, 0xE9, 0xE1):
+            with self.assertRaises(MidiError) as ctx:
+                parse(header(1, 1, (code << 8) | 0x28))
+            self.assertEqual(ctx.exception.code, "invalid_smpte_fps")
+            self.assertEqual(ctx.exception.offset, 12)
+
+    def test_smpte_zero_ticks_per_frame_rejected(self):
         with self.assertRaises(MidiError) as ctx:
-            parse(header(1, 1, 0xE728))  # -25 fps, 40 ticks/frame
-        self.assertEqual(ctx.exception.code, "unsupported_division")
-        self.assertEqual(ctx.exception.offset, 12)
+            parse(header(1, 1, 0xE800))  # -24 fps, 0 ticks/frame
+        self.assertEqual(ctx.exception.code, "invalid_smpte_resolution")
+        self.assertEqual(ctx.exception.offset, 13)
+
+    def test_smpte_parsed_fields(self):
+        parsed = parse(header(1, 1, 0xE364) + track(EOT))  # -29, 100 tpf
+        self.assertIsNone(parsed.ppqn)
+        self.assertEqual(parsed.smpte_fps, Fraction(30000, 1001))
+        self.assertEqual(parsed.ticks_per_frame, 100)
+
+    def test_ppqn_parsed_fields_unchanged(self):
+        parsed = parse(header(1, 1, 480) + track(EOT))
+        self.assertEqual(parsed.ppqn, 480)
+        self.assertIsNone(parsed.smpte_fps)
+        self.assertIsNone(parsed.ticks_per_frame)
 
     def test_zero_ppqn_rejected(self):
         with self.assertRaises(MidiError) as ctx:
@@ -365,6 +385,104 @@ class OrderingTests(unittest.TestCase):
             fractions(result),
             [Fraction(0)] + [Fraction(125000)] + [Fraction(250000)] * 3,
         )
+
+
+# -- SMPTE timing ------------------------------------------------------------
+
+
+def smpte_division(fps_code, ticks_per_frame):
+    """Encode the 16-bit division word for a SMPTE header."""
+    return ((fps_code & 0xFF) << 8) | ticks_per_frame
+
+
+class SmpteTests(unittest.TestCase):
+    def test_integer_frame_rate_timing_24fps(self):
+        # -24 fps, 40 ticks/frame -> 1 tick = 1e6/(24*40) = 3125/3 us.
+        payload = ev(0, 0x90, 60, 100) + ev(120, 0x80, 60, 0) + EOT
+        data = header(1, 1, smpte_division(-24, 40)) + track(payload)
+        result = normalize(data)
+        self.assertEqual(fractions(result), [Fraction(0), Fraction(125000)])
+
+    def test_integer_frame_rate_timing_25fps(self):
+        # 1 tick at -25 fps, 40 tpf = 1e6/1000 = 1000 us.
+        payload = ev(1, 0x90, 60, 100) + EOT
+        result = normalize(header(0, 1, smpte_division(-25, 40)) + track(payload))
+        self.assertEqual(fractions(result), [Fraction(1000)])
+
+    def test_integer_frame_rate_timing_30fps(self):
+        # -30 fps, 100 tpf: 1500 ticks = 15 frames = half a second (500000 us).
+        payload = ev(0, 0x90, 60, 100) + ev(1500, 0x80, 60, 0) + EOT
+        result = normalize(header(1, 1, smpte_division(-30, 100)) + track(payload))
+        self.assertEqual(fractions(result), [Fraction(0), Fraction(500000)])
+
+    def test_drop_frame_rate_is_30000_over_1001(self):
+        # -29 fps, 100 tpf: 1 tick = 1e6*1001/(30000*100) = 10010/30 us
+        # (kept as the reduced fraction 1001/3? 10010/30 -> 1001/3).
+        payload = ev(1, 0x90, 60, 100) + EOT
+        result = normalize(header(0, 1, smpte_division(-29, 100)) + track(payload))
+        self.assertEqual(fractions(result), [Fraction(1001, 3)])
+        td = result["time_division"]
+        self.assertEqual(td["type"], "smpte")
+        self.assertEqual(td["fps_code"], -29)
+        self.assertEqual(td["frame_rate"]["fraction"], "30000/1001")
+        self.assertEqual(td["ticks_per_frame"], 100)
+
+    def test_exact_frame_boundary_2997(self):
+        # One full frame = 100 ticks at -29 df -> 1001000/30 = 100100/3 us.
+        payload = ev(100, 0x90, 60, 100) + EOT
+        result = normalize(header(0, 1, smpte_division(-29, 100)) + track(payload))
+        self.assertEqual(fractions(result), [Fraction(100100, 3)])
+
+    def test_tempo_events_do_not_change_times(self):
+        # A legal tempo event on track 0 must not move SMPTE events.
+        conductor = tempo(0, 1) + tempo(50, 7) + EOT
+        notes = ev(0, 0x90, 60, 100) + ev(100, 0x80, 60, 0) + EOT
+        data = header(1, 2, smpte_division(-30, 100))
+        data += track(conductor) + track(notes)
+        result = normalize(data)
+        self.assertEqual(fractions(result), [Fraction(0), Fraction(1_000_000, 30)])
+
+    def test_format_0_tempo_event_is_inert(self):
+        payload = tempo(0, 1) + ev(1, 0x90, 60, 100) + EOT
+        result = normalize(header(0, 1, smpte_division(-25, 40)) + track(payload))
+        self.assertEqual(result["format"], 0)
+        self.assertEqual(fractions(result), [Fraction(1000)])
+
+    def test_bad_tempo_still_rejected_in_smpte_file(self):
+        with self.assertRaises(MidiError) as ctx:
+            normalize(
+                header(0, 1, smpte_division(-24, 40))
+                + track(ev(0, 0xFF, 0x51, 0x00))
+            )
+        self.assertEqual(ctx.exception.code, "bad_meta_length")
+
+    def test_ordering_by_tick_track_order(self):
+        t0 = ev(120, 0x90, 60, 100) + EOT
+        t1 = ev(0, 0x91, 61, 100) + ev(120, 0x81, 61, 0) + EOT
+        data = header(1, 2, smpte_division(-25, 40)) + track(t0) + track(t1)
+        result = normalize(data)
+        keys = [(e["tick"], e["track"], e["order"]) for e in result["events"]]
+        self.assertEqual(keys, [(0, 1, 0), (120, 0, 0), (120, 1, 1)])
+
+    def test_response_shape(self):
+        payload = ev(0, 0x90, 60, 100) + EOT
+        result = normalize(header(1, 1, smpte_division(-24, 40)) + track(payload))
+        self.assertNotIn("ppqn", result)
+        self.assertEqual(set(result), {
+            "format", "track_count", "channel_event_count", "events",
+            "time_division",
+        })
+        td = result["time_division"]
+        self.assertEqual(td["fps_code"], -24)
+        self.assertEqual(td["frame_rate"]["fraction"], "24/1")
+        self.assertEqual(td["ticks_per_frame"], 40)
+
+    def test_structural_damage_reports_offset_and_no_events(self):
+        data = header(1, 1, smpte_division(-24, 40)) + track(ev(0, 0xF8))
+        with self.assertRaises(MidiError) as ctx:
+            normalize(data)
+        self.assertEqual(ctx.exception.code, "illegal_status")
+        self.assertEqual(ctx.exception.offset, 23)
 
 
 if __name__ == "__main__":
