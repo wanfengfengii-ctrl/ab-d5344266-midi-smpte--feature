@@ -91,6 +91,22 @@ def build_smoke_file():
     return header(1, 3, 480) + track(conductor) + track(piano) + track(strings)
 
 
+def build_smpte_file():
+    """Format 1, SMPTE -29 (30000/1001 fps), 40 ticks/frame, two tracks.
+
+    Track 0 carries tempo meta events that are legal but must not move
+    anything: the timeline is pure frame time.  Tick 40 is exactly one
+    frame (100100/3 us); tick 80 is two frames (200200/3 us).
+    """
+    conductor = tempo(0, 1) + tempo(20, 12_000_000) + EOT
+    notes = (
+        ev(40, 0x90, 60, 100)       # tick 40  note on  -> 100100/3 us
+        + ev(40, 0x80, 60, 0)       # tick 80  note off -> 200200/3 us
+        + EOT
+    )
+    return header(1, 2, 0xE328) + track(conductor) + track(notes)
+
+
 # Expected timeline for build_smoke_file(): (tick, track, order, type,
 # channel, data, fraction-of-microseconds).
 EXPECTED_EVENTS = [
@@ -102,6 +118,12 @@ EXPECTED_EVENTS = [
     (960, 1, 3, "note_off", 0, [62, 0], "750000/1"),
     (1200, 1, 4, "note_on", 0, [64, 100], "1250000/1"),
     (1260, 1, 5, "note_on", 0, [64, 0], "1375000/1"),
+]
+
+# Expected timeline for build_smpte_file().
+EXPECTED_SMPTE_EVENTS = [
+    (40, 1, 0, "note_on", 0, [60, 100], "100100/3"),
+    (80, 1, 1, "note_off", 0, [60, 0], "200200/3"),
 ]
 
 
@@ -235,6 +257,96 @@ def step_api_smoke():
         )
     keys = [(e["tick"], e["track"], e["order"]) for e in events]
     suite.check("events sorted by (tick, track, order)", keys == sorted(keys))
+    suite.check(
+        "PPQN response has ppqn, no time_division",
+        body.get("ppqn") == 480 and "time_division" not in body,
+        f"got ppqn={body.get('ppqn')!r}, time_division in body",
+    )
+
+    # -- SMPTE happy path: -29 (30000/1001 fps), tempo events inert -------
+    status, sbody = post(build_smpte_file())
+    suite.check("SMPTE: status 200", status == 200, f"got {status}: {sbody}")
+    if status == 200:
+        suite.check("SMPTE: format is 1", sbody.get("format") == 1)
+        suite.check("SMPTE: track_count is 2", sbody.get("track_count") == 2)
+        suite.check(
+            "SMPTE: no ppqn field",
+            "ppqn" not in sbody,
+            f"got ppqn={sbody.get('ppqn')!r}",
+        )
+        td = sbody.get("time_division", {})
+        suite.check("SMPTE: kind", td.get("kind") == "smpte", f"got {td}")
+        suite.check(
+            "SMPTE: ticks_per_frame 40",
+            td.get("ticks_per_frame") == 40,
+            f"got {td.get('ticks_per_frame')}",
+        )
+        suite.check(
+            "SMPTE: frame rate 30000/1001",
+            td.get("frame_rate", {}).get("fraction") == "30000/1001",
+            f"got {td.get('frame_rate')}",
+        )
+        sevents = sbody.get("events", [])
+        suite.check(
+            "SMPTE: 2 events returned", len(sevents) == 2, f"got {len(sevents)}"
+        )
+        for i, expected in enumerate(EXPECTED_SMPTE_EVENTS):
+            if i >= len(sevents):
+                break
+            tick, trk, order, etype, channel, data, fraction = expected
+            got = sevents[i]
+            want = {
+                "tick": tick,
+                "track": trk,
+                "order": order,
+                "type": etype,
+                "channel": channel,
+                "data": data,
+            }
+            actual = {k: got.get(k) for k in want}
+            suite.check(f"SMPTE event {i} identity", actual == want,
+                        f"want {want}, got {actual}")
+            suite.check(
+                f"SMPTE event {i} time {fraction}",
+                got.get("time_us", {}).get("fraction") == fraction,
+                f"got {got.get('time_us')}",
+            )
+
+    # -- SMPTE structural errors: offset reported, no partial timeline ----
+    smpte_cases = [
+        (
+            "SMPTE bad frame-rate code",
+            header(0, 1, 0xE628) + track(EOT),  # -26 fps
+            "invalid_frame_rate",
+        ),
+        (
+            "SMPTE zero ticks per frame",
+            header(0, 1, 0xE700) + track(EOT),
+            "invalid_ticks_per_frame",
+        ),
+        (
+            "SMPTE corrupted track",
+            header(1, 1, 0xE728) + track(ev(0, 0xF8)),
+            "illegal_status",
+        ),
+        (
+            "SMPTE truncated body",
+            header(1, 1, 0xE728) + b"MTrk" + (100).to_bytes(4, "big") + b"\x00",
+            "truncated_track",
+        ),
+    ]
+    for label, payload, code in smpte_cases:
+        status, body = post(payload)
+        err = body.get("error", {})
+        suite.check(f"{label}: HTTP 400", status == 400, f"got {status}")
+        suite.check(f"{label}: code {code}", err.get("code") == code,
+                    f"got {err.get('code')}")
+        suite.check(
+            f"{label}: locating offset",
+            isinstance(err.get("offset"), int) and err["offset"] >= 0,
+            f"got {err.get('offset')}",
+        )
+        suite.check(f"{label}: no partial timeline", "events" not in body)
 
     # -- structural errors: offset reported, no partial timeline ----------
     valid = build_smoke_file()

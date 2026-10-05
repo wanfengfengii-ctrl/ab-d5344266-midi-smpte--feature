@@ -9,6 +9,7 @@ from app.midi import (
     build_tempo_segments,
     normalize,
     parse,
+    smpte_time_at_tick,
     time_at_tick,
     TempoEvent,
 )
@@ -85,11 +86,35 @@ class HeaderTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "unsupported_format")
         self.assertEqual(ctx.exception.offset, 8)
 
-    def test_smpte_division_rejected(self):
-        with self.assertRaises(MidiError) as ctx:
-            parse(header(1, 1, 0xE728))  # -25 fps, 40 ticks/frame
-        self.assertEqual(ctx.exception.code, "unsupported_division")
-        self.assertEqual(ctx.exception.offset, 12)
+    def test_invalid_frame_rate_code_rejected(self):
+        # -26, -28, -2 and -128 are all outside {-24, -25, -29, -30}.
+        for word in (0xE628, 0xE428, 0xFE28, 0x8028):
+            with self.assertRaises(MidiError) as ctx:
+                parse(header(1, 1, word))
+            self.assertEqual(ctx.exception.code, "invalid_frame_rate", word)
+            self.assertEqual(ctx.exception.offset, 12, word)
+
+    def test_zero_ticks_per_frame_rejected(self):
+        for word in (0xE800, 0xE700, 0xE300, 0xE200):
+            with self.assertRaises(MidiError) as ctx:
+                parse(header(1, 1, word))
+            self.assertEqual(ctx.exception.code, "invalid_ticks_per_frame", word)
+            self.assertEqual(ctx.exception.offset, 13, word)
+
+    def test_smpte_accepted_codes(self):
+        for word, fps in (
+            (0xE828, Fraction(24, 1)),
+            (0xE728, Fraction(25, 1)),
+            (0xE328, Fraction(30000, 1001)),
+            (0xE228, Fraction(30, 1)),
+        ):
+            data = header(1, 1, word) + track(ev(0, 0x90, 60, 100) + EOT)
+            parsed = parse(data)
+            self.assertTrue(parsed.is_smpte)
+            self.assertEqual(parsed.fps, fps)
+            self.assertEqual(parsed.ticks_per_frame, 40)
+            # Tempo meta events remain legal but build no tempo map.
+            self.assertEqual(parsed.tempo_events, [])
 
     def test_zero_ppqn_rejected(self):
         with self.assertRaises(MidiError) as ctx:
@@ -365,6 +390,152 @@ class OrderingTests(unittest.TestCase):
             fractions(result),
             [Fraction(0)] + [Fraction(125000)] + [Fraction(250000)] * 3,
         )
+
+
+# -- SMPTE timing ------------------------------------------------------------
+
+
+class SmpteTests(unittest.TestCase):
+    def test_time_formula_directly(self):
+        self.assertEqual(
+            smpte_time_at_tick(0, Fraction(25, 1), 40), Fraction(0)
+        )
+        # 25 fps * 40 ticks/frame = 1000 ticks/s, so 1 tick = 1000 us.
+        self.assertEqual(
+            smpte_time_at_tick(1, Fraction(25, 1), 40), Fraction(1000)
+        )
+        # 24 fps, 40 ticks/frame: one frame is 1/24 s = 125000/3 us.
+        self.assertEqual(
+            smpte_time_at_tick(40, Fraction(24, 1), 40), Fraction(125000, 3)
+        )
+        # 30 fps, 100 ticks/frame: 3000 ticks/s.
+        self.assertEqual(
+            smpte_time_at_tick(3000, Fraction(30, 1), 100), Fraction(1_000_000)
+        )
+        # 30000/1001 fps: one frame = 100100/3 us.
+        self.assertEqual(
+            smpte_time_at_tick(40, Fraction(30000, 1001), 40),
+            Fraction(100100, 3),
+        )
+
+    def test_integer_frame_rate_timeline(self):
+        # -25 fps, 40 ticks/frame -> 1000 ticks/second -> 1000 us/tick.
+        payload = (
+            ev(0, 0x90, 60, 100)       # tick 0
+            + ev(100, 0x80, 60, 0)     # tick 100 -> 100000 us
+            + EOT
+        )
+        result = normalize(header(1, 1, 0xE728) + track(payload))
+        self.assertEqual(fractions(result), [Fraction(0), Fraction(100000)])
+
+    def test_24fps_reduced_fraction(self):
+        payload = ev(1, 0x90, 60, 100) + EOT  # 1 tick at 24fps*40
+        result = normalize(header(0, 1, 0xE828) + track(payload))
+        # 1_000_000 / 960 = 3125/3 us
+        self.assertEqual(fractions(result), [Fraction(3125, 3)])
+        self.assertEqual(
+            result["events"][0]["time_us"]["fraction"], "3125/3"
+        )
+
+    def test_2997_drop_frame_rate(self):
+        # -29 means 30000/1001 fps, 40 ticks/frame.
+        payload = (
+            ev(40, 0x90, 60, 100)     # tick 40 = one frame
+            + ev(40, 0x80, 60, 0)     # tick 80 = two frames
+            + EOT
+        )
+        result = normalize(header(1, 1, 0xE328) + track(payload))
+        self.assertEqual(
+            fractions(result),
+            [Fraction(100100, 3), Fraction(200200, 3)],
+        )
+
+    def test_30fps(self):
+        payload = ev(1200, 0x90, 60, 100) + EOT  # 30fps*40 = 1200 t/s
+        result = normalize(header(1, 1, 0xE228) + track(payload))
+        self.assertEqual(fractions(result), [Fraction(1_000_000)])
+
+    def test_tempo_events_do_not_change_smpte_time(self):
+        # Even an absurd, but legal, tempo on track 0 must not move events.
+        conductor = (
+            tempo(0, 1)
+            + tempo(20, 12_000_000)
+            + EOT
+        )
+        notes = (
+            ev(100, 0x90, 60, 100)
+            + ev(100, 0x80, 60, 0)
+            + EOT
+        )
+        data = header(1, 2, 0xE728) + track(conductor) + track(notes)
+        result = normalize(data)
+        self.assertEqual(fractions(result), [Fraction(100000), Fraction(200000)])
+
+    def test_illegal_tempo_still_rejected_in_smpte_file(self):
+        payload = tempo(0, 0) + EOT
+        with self.assertRaises(MidiError) as ctx:
+            parse(header(1, 1, 0xE728) + track(payload))
+        self.assertEqual(ctx.exception.code, "invalid_tempo")
+
+    def test_multitrack_stable_ordering(self):
+        t0 = ev(50, 0x90, 60, 100) + EOT
+        t1 = ev(0, 0x91, 61, 100) + ev(50, 0x81, 61, 0) + EOT
+        data = header(1, 2, 0xE728) + track(t0) + track(t1)
+        result = normalize(data)
+        keys = [(e["tick"], e["track"], e["order"]) for e in result["events"]]
+        self.assertEqual(keys, [(0, 1, 0), (50, 0, 0), (50, 1, 1)])
+        self.assertEqual(
+            fractions(result),
+            [Fraction(0), Fraction(50000), Fraction(50000)],
+        )
+
+    def test_response_shape_smpte(self):
+        payload = ev(0, 0x90, 60, 100) + EOT
+        result = normalize(header(1, 1, 0xE328) + track(payload))
+        self.assertNotIn("ppqn", result)
+        td = result["time_division"]
+        self.assertEqual(td["kind"], "smpte")
+        self.assertEqual(td["ticks_per_frame"], 40)
+        self.assertEqual(
+            td["frame_rate"],
+            {
+                "numerator": 30000,
+                "denominator": 1001,
+                "fraction": "30000/1001",
+            },
+        )
+
+    def test_response_shape_integer_frame_rate(self):
+        payload = ev(0, 0x90, 60, 100) + EOT
+        result = normalize(header(0, 1, 0xE801) + track(payload))  # 24fps, 1 tpf
+        self.assertNotIn("ppqn", result)
+        td = result["time_division"]
+        self.assertEqual(td["kind"], "smpte")
+        self.assertEqual(td["ticks_per_frame"], 1)
+        self.assertEqual(td["frame_rate"]["fraction"], "24/1")
+
+    def test_ppqn_response_unchanged(self):
+        payload = ev(0, 0x90, 60, 100) + EOT
+        result = normalize(header(1, 1, 480) + track(payload))
+        self.assertEqual(result["ppqn"], 480)
+        self.assertNotIn("time_division", result)
+        self.assertEqual(set(result["events"][0]), {
+            "tick", "track", "order", "type", "channel", "data", "time_us"
+        })
+
+    def test_structural_error_inside_smpte_track_has_offset(self):
+        data = header(1, 1, 0xE728) + track(ev(0, 0xF8))
+        with self.assertRaises(MidiError) as ctx:
+            parse(data)
+        self.assertEqual(ctx.exception.code, "illegal_status")
+        self.assertEqual(ctx.exception.offset, 23)
+
+    def test_truncated_smpte_file_has_offset(self):
+        data = header(1, 1, 0xE728) + b"MTrk" + (100).to_bytes(4, "big") + b"\x00"
+        with self.assertRaises(MidiError) as ctx:
+            parse(data)
+        self.assertEqual(ctx.exception.code, "truncated_track")
+        self.assertEqual(ctx.exception.offset, 18)
 
 
 if __name__ == "__main__":

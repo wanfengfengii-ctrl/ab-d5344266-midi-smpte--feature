@@ -1,12 +1,22 @@
 """Strict Standard MIDI File (SMF) parsing and timeline normalization.
 
-Only formats 0 and 1 with a positive PPQN division are supported.  The
-parser is deliberately strict: truncated data, malformed variable-length
-integers, broken running status, illegal status bytes, bad event lengths
-and undeclared trailing bytes are all rejected with a byte offset that
-locates the problem.  No partial timeline is ever produced: either the
-whole file parses and every channel event gets an exact microsecond
-instant (a reduced fraction), or a single :class:`MidiError` is raised.
+Both time-division families are supported for SMF formats 0 and 1:
+
+* positive PPQN (ticks per quarter note): the timeline follows the tempo
+  map established by tempo meta events on the first track;
+* SMPTE (high division byte -24, -25, -29 or -30, positive ticks per
+  frame): the timeline is real time derived straight from the frame rate,
+  so tempo meta events are parsed and validated but never move events.
+  The -29 code means the 30000/1001 frames-per-second rate ("drop frame"
+  29.97); the other codes are their integer frame rates.
+
+The parser is deliberately strict: truncated data, malformed variable-length
+integers, broken running status, illegal status bytes, bad event lengths,
+illegal frame-rate codes and undeclared trailing bytes are all rejected with
+a byte offset that locates the problem.  No partial timeline is ever
+produced: either the whole file parses and every channel event gets an
+exact microsecond instant (a reduced fraction), or a single
+:class:`MidiError` is raised.
 """
 
 from __future__ import annotations
@@ -18,6 +28,16 @@ from typing import List, Tuple
 MAX_FILE_BYTES = 1 << 20  # 1 MiB
 MAX_TRACKS_PLUS_EVENTS = 10_000
 DEFAULT_TEMPO_US_PER_QUARTER = 500_000
+
+# SMPTE division high byte -> frames per second, as an exact fraction.
+# -29 means 30000/1001 fps (the "29.97 drop-frame" rate); the rest are
+# integer rates.  Every frame holds a positive number of ticks.
+SMPTE_FRAME_RATES = {
+    -24: Fraction(24, 1),
+    -25: Fraction(25, 1),
+    -29: Fraction(30000, 1001),
+    -30: Fraction(30, 1),
+}
 
 CHANNEL_EVENT_NAMES = {
     0x80: "note_off",
@@ -62,10 +82,22 @@ class TempoEvent:
 @dataclass
 class ParsedMidi:
     fmt: int
-    ppqn: int
+    division: int  # raw 16-bit division word
     ntracks: int
+    # SMPTE timing is set for frame-based files; PPQN files leave these None.
+    fps: "Fraction | None" = None
+    ticks_per_frame: int | None = None
     channel_events: List[ChannelEvent] = field(default_factory=list)
     tempo_events: List[TempoEvent] = field(default_factory=list)  # track 0 only
+
+    @property
+    def is_smpte(self) -> bool:
+        return self.fps is not None
+
+    @property
+    def ppqn(self) -> int:
+        """Ticks per quarter note; only meaningful for PPQN files."""
+        return self.division
 
 
 def _read_varlen(data: bytes, pos: int, end: int) -> Tuple[int, int]:
@@ -124,13 +156,31 @@ def parse(data: bytes) -> ParsedMidi:
     ntracks = int.from_bytes(data[10:12], "big")
     division = int.from_bytes(data[12:14], "big")
     if division & 0x8000:
-        raise MidiError(
-            "unsupported_division",
-            "SMPTE time division is not supported; a positive PPQN is required",
-            12,
-        )
-    if division == 0:
+        # SMPTE time: high byte is a signed frame-rate code, low byte the
+        # (positive) number of ticks per frame.
+        fps_code = division >> 8
+        if fps_code >= 0x80:
+            fps_code -= 0x100
+        ticks_per_frame = division & 0x00FF
+        if fps_code not in SMPTE_FRAME_RATES:
+            raise MidiError(
+                "invalid_frame_rate",
+                f"unsupported SMPTE frame-rate code {fps_code} at offset 12; "
+                "expected -24, -25, -29 or -30",
+                12,
+            )
+        if ticks_per_frame == 0:
+            raise MidiError(
+                "invalid_ticks_per_frame",
+                "SMPTE ticks-per-frame byte at offset 13 must be positive",
+                13,
+            )
+        fps = SMPTE_FRAME_RATES[fps_code]
+    elif division == 0:
         raise MidiError("invalid_division", "PPQN division must be positive", 12)
+    else:
+        fps = None
+        ticks_per_frame = None
     if ntracks == 0:
         raise MidiError("no_tracks", "file declares zero tracks", 10)
     if fmt == 0 and ntracks != 1:
@@ -147,7 +197,13 @@ def parse(data: bytes) -> ParsedMidi:
             10,
         )
 
-    parsed = ParsedMidi(fmt=fmt, ppqn=division, ntracks=ntracks)
+    parsed = ParsedMidi(
+        fmt=fmt,
+        division=division,
+        ntracks=ntracks,
+        fps=fps,
+        ticks_per_frame=ticks_per_frame,
+    )
     pos = 8 + header_len
     for track_index in range(ntracks):
         if pos + 8 > len(data):
@@ -293,9 +349,11 @@ def _parse_track(
                         "must be positive",
                         status_offset,
                     )
-                # Only the first track builds the global tempo map.  For
-                # format 0 that is also the only track, so the rule is uniform.
-                if track_index == 0:
+                # Tempo meta events are legal in every file but only the
+                # first track of a tempo-based (PPQN) file builds the
+                # global tempo map.  SMPTE files run on real frame time,
+                # so a tempo event changes nothing and is not recorded.
+                if parsed.fps is None and track_index == 0:
                     parsed.tempo_events.append(TempoEvent(tick=tick, tempo_us=tempo_us))
             elif meta_type == _META_END_OF_TRACK and meta_len != 0:
                 raise MidiError(
@@ -356,16 +414,39 @@ def time_at_tick(
     return total
 
 
+def smpte_time_at_tick(
+    tick: int, fps: Fraction, ticks_per_frame: int
+) -> Fraction:
+    """Exact microsecond instant of ``tick`` under an SMPTE division.
+
+    Time advances uniformly: ``tick`` ticks span ``tick / (fps *
+    ticks_per_frame)`` seconds, regardless of any tempo events the file
+    may contain.
+    """
+    return Fraction(tick * 1_000_000, fps * ticks_per_frame)
+
+
 def normalize(data: bytes) -> dict:
     """Parse ``data`` and return the normalized channel-event timeline."""
     parsed = parse(data)
-    segments = build_tempo_segments(parsed.tempo_events)
     ordered = sorted(
         parsed.channel_events, key=lambda e: (e.tick, e.track, e.order)
     )
+    if parsed.is_smpte:
+        # Frame-based real time; tempo events never alter the timeline.
+        def moment_for(event: ChannelEvent) -> Fraction:
+            return smpte_time_at_tick(
+                event.tick, parsed.fps, parsed.ticks_per_frame
+            )
+    else:
+        segments = build_tempo_segments(parsed.tempo_events)
+
+        def moment_for(event: ChannelEvent) -> Fraction:
+            return time_at_tick(event.tick, segments, parsed.ppqn)
+
     events = []
     for event in ordered:
-        moment = time_at_tick(event.tick, segments, parsed.ppqn)
+        moment = moment_for(event)
         events.append(
             {
                 "tick": event.tick,
@@ -381,10 +462,30 @@ def normalize(data: bytes) -> dict:
                 },
             }
         )
-    return {
-        "format": parsed.fmt,
-        "ppqn": parsed.ppqn,
-        "track_count": parsed.ntracks,
-        "channel_event_count": len(events),
-        "events": events,
-    }
+    if parsed.is_smpte:
+        fps = parsed.fps
+        result = {
+            "format": parsed.fmt,
+            "time_division": {
+                "kind": "smpte",
+                "frame_rate": {
+                    "numerator": fps.numerator,
+                    "denominator": fps.denominator,
+                    "fraction": f"{fps.numerator}/{fps.denominator}",
+                },
+                "ticks_per_frame": parsed.ticks_per_frame,
+            },
+            "track_count": parsed.ntracks,
+            "channel_event_count": len(events),
+            "events": events,
+        }
+    else:
+        # PPQN response keeps its original fields and shape unchanged.
+        result = {
+            "format": parsed.fmt,
+            "ppqn": parsed.ppqn,
+            "track_count": parsed.ntracks,
+            "channel_event_count": len(events),
+            "events": events,
+        }
+    return result

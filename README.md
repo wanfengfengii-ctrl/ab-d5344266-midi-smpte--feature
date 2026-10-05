@@ -8,11 +8,14 @@ Docker 构建无需安装任何依赖。
 
 ### `POST /api/midi/normalize`
 
-请求体为原始 MIDI 字节（不超过 1 MiB）。支持格式 0、1 与正数 PPQN；
-轨道数与通道事件数之和不得超过 10000。
+请求体为原始 MIDI 字节（不超过 1 MiB）。支持格式 0、1；时间分度支持正数
+PPQN 以及 SMPTE 帧时基（分度高字节为 -24、-25、-29、-30，且每帧 tick 数为
+正）。轨道数与通道事件数之和不得超过 10000。
 
 **成功（200）**：按 `(tick, track, order)` 稳定排序的通道事件，每个事件带精确
-微秒时刻（最简分数）：
+微秒时刻（最简分数）。
+
+PPQN 请求的字段与既有版本完全一致：
 
 ```json
 {
@@ -34,20 +37,49 @@ Docker 构建无需安装任何依赖。
 }
 ```
 
+SMPTE 请求不带 `ppqn`，改为以 `time_division` 返回帧率（最简分数；-29 为
+`30000/1001`）与每帧 tick 数：
+
+```json
+{
+  "format": 1,
+  "time_division": {
+    "kind": "smpte",
+    "frame_rate": {"numerator": 30000, "denominator": 1001,
+                   "fraction": "30000/1001"},
+    "ticks_per_frame": 40
+  },
+  "track_count": 2,
+  "channel_event_count": 2,
+  "events": [
+    {"tick": 40, "track": 1, "order": 0, "type": "note_on",
+     "channel": 0, "data": [60, 100],
+     "time_us": {"numerator": 100100, "denominator": 3,
+                 "fraction": "100100/3"}}
+  ]
+}
+```
+
 **结构错误（400）**：返回可定位的字节偏移，绝不返回部分时间轴：
 
 ```json
 {"error": {"code": "truncated_track", "message": "...", "offset": 18}}
 ```
 
-其他状态码：413（超过 1 MiB）、405 / 404 / 411。
+非法帧率代码返回 `invalid_frame_rate`（offset 12），每帧 tick 为零返回
+`invalid_ticks_per_frame`（offset 13）。其他状态码：413（超过 1 MiB）、
+405 / 404 / 411。
 
 ### 语义要点
 
 - 初始速度 500000 µs/四分音符；格式 1 仅以首轨速度事件建立全局节拍表，
   速度在其所在 tick 起生效（同 tick 多个速度事件取最后一个）。
+- SMPTE 文件的时间直接来自帧时基：
+  `time_us = tick × 1_000_000 / (帧率 × 每帧 tick 数)`，速度事件合法但
+  不改变任何时刻；无帧率转换，因此不存在转码舍入或事件漂移。
 - 严格校验：文件块、变长整数（≤4 字节）、运行状态（meta/sysex 会取消）、
-  事件长度、数据字节高位；拒绝截断数据、非法状态与尾部未声明字节。
+  事件长度、数据字节高位；拒绝截断数据、非法帧率代码、零每帧 tick、
+  非法状态与尾部未声明字节。
 - 时间以 `Fraction` 精确累计，输出为最简微秒分数。
 
 ### `GET /health`
@@ -64,8 +96,8 @@ HOST_PORT=9000 docker compose up app     # 可配置宿主机端口
 ## 验证（一次性 verify 服务）
 
 verify 服务在 app 健康检查通过后依次执行：单元测试 → 构建检查
-（compileall + 模块导入）→ 含变速多轨文件的 API 冒烟（含错误用例），
-并以退出码报告结论（0 = 通过）：
+（compileall + 模块导入）→ API 冒烟（PPQN 变速多轨文件、SMPTE 帧时基文件，
+含错误用例），并以退出码报告结论（0 = 通过）：
 
 ```bash
 docker compose up --build --exit-code-from verify verify
@@ -84,10 +116,10 @@ APP_URL=http://127.0.0.1:8000 python3 -m verify.verify
 ## 结构
 
 ```
-app/midi.py      严格 SMF 解析、节拍表、精确分数时间
+app/midi.py      严格 SMF 解析、节拍表/SMPTE 帧时基、精确分数时间
 app/server.py    HTTP 前端（stdlib http.server）
-tests/           单元测试（41 例）
-verify/          一次性验证服务（测试 + 构建检查 + API 冒烟）
+tests/           单元测试（56 例）
+verify/          一次性验证服务（测试 + 构建检查 + PPQN/SMPTE API 冒烟）
 Dockerfile       python:3.12-slim，无依赖安装
 docker-compose.yml  app（健康检查、可配置宿主机端口）+ verify
 ```
